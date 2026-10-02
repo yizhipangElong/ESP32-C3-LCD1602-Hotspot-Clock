@@ -1,14 +1,6 @@
 /*
  * ESP32-C3 + PCF8574T LCD1602 network clock
- *
- * Target: Arduino-ESP32 3.3.12, board "ESP32C3 Dev Module"
- * LCD driver: built-in write-only PCF8574T driver
- *
- * Enterprise Wi-Fi security model:
- *   - WPA2-Enterprise PEAP with inner MSCHAPv2
- *   - ESP-IDF's built-in CA bundle is required
- *   - the configured EAP server certificate domain is strictly checked
- *   - no insecure certificate bypass is attempted
+ * 项目一：开机最多尝试3次联网、断网隐藏秒、开机强制保存、每小时Flash备份
  */
 
 #include <Arduino.h>
@@ -41,10 +33,8 @@
 
 #if defined(CONFIG_IDF_TARGET_ESP32C3) && defined(ARDUINO_USB_MODE) && ARDUINO_USB_MODE \
     && defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT
-// ESP32-C3's USB connector is the fixed USB Serial/JTAG CDC interface.
 #define USB_SERIAL_PORT HWCDCSerial
 #else
-// Fallback for builds that have not enabled USB CDC On Boot yet.
 #define USB_SERIAL_PORT Serial
 #endif
 
@@ -62,10 +52,14 @@ static bool ntpFailureShown = false;
 static uint32_t connectStartedAt = 0;
 static uint32_t nextWifiAttemptAt = 0;
 static uint32_t ntpStartedAt = 0;
-static uint32_t nextNtpAttemptAt = 0;
 static uint32_t lastClockDrawAt = 0;
 static uint32_t clockDisplayAfter = 0;
 static uint64_t lastSavedEpoch = 0;
+static uint32_t lastTimeSaveAt = 0;
+
+static uint8_t wifiAttemptCount = 0;
+static bool wifiGaveUp = false;
+
 static bool lastColonVisible = true;
 static bool clockDigitsInitialized = false;
 static bool bigScanActive = false;
@@ -120,39 +114,34 @@ static constexpr uint8_t BIG_SCAN_LINE_GLYPH = 7;
 static constexpr uint8_t SECOND_GLYPH_TENS = 6;
 static constexpr uint8_t SECOND_GLYPH_ONES = 7;
 
-// CGRAM 0..5 form the shared 3-column x 2-row large-number font.
 static constexpr uint8_t BIG_GLYPHS[BIG_GLYPH_COUNT][8] = {
-  { B11111, B11111, B11111, B00000, B00000, B00000, B00000, B00000 }, // 0 upper bar
-  { B00000, B00000, B00000, B00000, B00000, B11111, B11111, B11111 }, // 1 lower bar
-  { B11111, B11111, B11111, B00000, B00000, B00000, B11111, B11111 }, // 2 upper/lower
-  { B11100, B11100, B11100, B11100, B11100, B11100, B11100, B11100 }, // 3 left bar
-  { B00000, B00000, B00000, B00000, B00000, B11100, B11100, B11100 }, // 4 lower-left
-  { B11100, B11100, B11100, B00000, B00000, B00000, B11100, B11100 }, // 5 upper/lower-left
+  { B11111, B11111, B11111, B00000, B00000, B00000, B00000, B00000 },
+  { B00000, B00000, B00000, B00000, B00000, B11111, B11111, B11111 },
+  { B11111, B11111, B11111, B00000, B00000, B00000, B11111, B11111 },
+  { B11100, B11100, B11100, B11100, B11100, B11100, B11100, B11100 },
+  { B00000, B00000, B00000, B00000, B00000, B11100, B11100, B11100 },
+  { B11100, B11100, B11100, B00000, B00000, B00000, B11100, B11100 },
 };
 
-// Kept separately so SHOW_SECONDS=0 can restore the original custom colon.
 static constexpr uint8_t BIG_COLON_GLYPH[8] = {
   B00000, B00000, B01110, B01110, B01110, B00000, B00000, B00000
 };
 
 #if SHOW_SECONDS
-// Compact square sci-fi glyphs. The last row is intentionally blank so the
-// scan line can travel through a clean 5x8 cell.
 static constexpr uint8_t SECOND_DIGITS[10][8] = {
-  {B01110, B11011, B11011, B11011, B11011, B11011, B01110, B00000}, // 0
-  {B00110, B01110, B00110, B00110, B00110, B00110, B11111, B00000}, // 1
-  {B11110, B00011, B00011, B01110, B11000, B11000, B11111, B00000}, // 2
-  {B11110, B00011, B00011, B01110, B00011, B00011, B11110, B00000}, // 3
-  {B11011, B11011, B11011, B11111, B00011, B00011, B00011, B00000}, // 4
-  {B11111, B11000, B11000, B11110, B00011, B00011, B11110, B00000}, // 5
-  {B01110, B11000, B11000, B11110, B11011, B11011, B01110, B00000}, // 6
-  {B11111, B00011, B00011, B00110, B01100, B01100, B01100, B00000}, // 7
-  {B01110, B11011, B11011, B01110, B11011, B11011, B01110, B00000}, // 8
-  {B01110, B11011, B11011, B01111, B00011, B00011, B01110, B00000}  // 9
+  {B01110, B11011, B11011, B11011, B11011, B11011, B01110, B00000},
+  {B00110, B01110, B00110, B00110, B00110, B00110, B11111, B00000},
+  {B11110, B00011, B00011, B01110, B11000, B11000, B11111, B00000},
+  {B11110, B00011, B00011, B01110, B00011, B00011, B11110, B00000},
+  {B11011, B11011, B11011, B11111, B00011, B00011, B00011, B00000},
+  {B11111, B11000, B11000, B11110, B00011, B00011, B11110, B00000},
+  {B01110, B11000, B11000, B11110, B11011, B11011, B01110, B00000},
+  {B11111, B00011, B00011, B00110, B01100, B01100, B01100, B00000},
+  {B01110, B11011, B11011, B01110, B11011, B11011, B01110, B00000},
+  {B01110, B11011, B11011, B01111, B00011, B00011, B01110, B00000}
 };
 #endif
 
-// Token order: ':', then three cells for every digit from 0 to 9.
 static constexpr uint8_t BIG_FONT[2][31] = {
   {0x07,
    LCD_SOLID_BLOCK, 0x00, 0x03, BIG_TOKEN_BLANK, 0x03, BIG_TOKEN_BLANK,
@@ -184,8 +173,6 @@ static void showStatus(const char *line1, const char *line2, uint32_t holdMs = 0
   writePadded(0, line1);
   writePadded(1, line2);
   clockDisplayAfter = millis() + holdMs;
-  // Status screens interrupt the clock. Resume from the current time instead
-  // of replaying a scan that may have become stale while Wi-Fi was reconnecting.
   clockDigitsInitialized = false;
   bigScanActive = false;
   bigScanRestorePending = false;
@@ -221,8 +208,6 @@ static int monthNumber(const char *month) {
   return 1;
 }
 
-// Howard Hinnant's civil-date conversion, kept local so no timezone-dependent
-// mktime() call is needed before the network time has been established.
 static int64_t daysFromCivil(int year, unsigned month, unsigned day) {
   year -= month <= 2;
   const int era = (year >= 0 ? year : year - 399) / 400;
@@ -276,19 +261,20 @@ static void restoreLastKnownTime() {
                                                ? "saved NTP time" : "firmware build time");
 }
 
-static void saveCurrentTime() {
+// 👇 修改：增加 force 参数，强制保存时跳过 1 小时限制
+static void saveCurrentTime(bool force = false) {
   const time_t now = time(nullptr);
   if (now < MIN_VALID_EPOCH) return;
   const uint64_t epoch = static_cast<uint64_t>(now);
-  if (lastSavedEpoch >= static_cast<uint64_t>(MIN_VALID_EPOCH)
+  
+  if (!force && lastSavedEpoch >= static_cast<uint64_t>(MIN_VALID_EPOCH)
       && epoch >= lastSavedEpoch
       && epoch - lastSavedEpoch < TIME_SAVE_MIN_INTERVAL_SEC) {
-    USB_SERIAL_PORT.println("NTP time not written: saved value is less than 24 hours old");
     return;
   }
   preferences.putBytes("epoch", &epoch, sizeof(epoch));
   lastSavedEpoch = epoch;
-  USB_SERIAL_PORT.println("NTP time saved to flash");
+  USB_SERIAL_PORT.println("Time saved to flash");
 }
 
 // ---------- Wi-Fi and NTP ----------
@@ -307,18 +293,12 @@ static bool configureEnterpriseSecurity() {
     return false;
   }
 
-  // ESP-IDF's enterprise client defaults this flag to disabled time checking
-  // on some builds. Re-enable it so the CA validity window is checked. The
-  // build-time / saved-time bootstrap above supplies a sane initial clock.
   const esp_err_t timeCheckResult = esp_eap_client_set_disable_time_check(false);
   if (timeCheckResult != ESP_OK) {
     USB_SERIAL_PORT.printf("Unable to enable EAP certificate time checks: %s\n", esp_err_to_name(timeCheckResult));
     return false;
   }
 
-  // WPA2_AUTH_PEAP in WiFi.begin() selects PEAP for this connection. The
-  // public esp_eap_client API in Arduino-ESP32 3.x does not expose a generic
-  // esp_eap_client_set_eap_methods() function.
   USB_SERIAL_PORT.printf("EAP PEAP + CA bundle enabled; server domain=%s\n", EAP_SERVER_DOMAIN);
   return true;
 #else
@@ -329,6 +309,9 @@ static bool configureEnterpriseSecurity() {
 #endif
 
 static void beginWifiConnection() {
+  ++wifiAttemptCount;
+  USB_SERIAL_PORT.printf("WiFi connection attempt %u/%u\n", wifiAttemptCount, WIFI_MAX_ATTEMPTS);
+
 #if NETWORK_MODE == NETWORK_MODE_ENTERPRISE_EAP
   if (strlen(EAP_PASSWORD) == 0) {
     networkState = NetworkState::PasswordMissing;
@@ -347,20 +330,15 @@ static void beginWifiConnection() {
 
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(false);
-  // The compatibility WiFi object uses (wifioff, eraseap, timeout).
-  // Do not erase the saved AP configuration during a normal retry.
   WiFi.disconnect(false, false, 1000);
   delay(100);
 
 #if NETWORK_MODE == NETWORK_MODE_ENTERPRISE_EAP
-  // The overload selects PEAP. For PEAP/MSCHAPv2 the username and password
-  // parameters are the inner (phase-2) credentials.
   WiFi.begin(ENTERPRISE_WIFI_SSID, WPA2_AUTH_PEAP, EAP_IDENTITY, EAP_USERNAME, EAP_PASSWORD);
   showStatus("WiFi: EAP", "connecting...", WIFI_STATUS_HOLD_MS);
   USB_SERIAL_PORT.printf("Connecting to enterprise SSID: %s (PEAP/MSCHAPv2)\n",
                          ENTERPRISE_WIFI_SSID);
 #else
-  // Require WPA2 or stronger when using the normal personal-network profile.
   WiFi.setMinSecurity(WIFI_AUTH_WPA2_PSK);
   WiFi.begin(PERSONAL_WIFI_SSID, PERSONAL_WIFI_PASSWORD);
   showStatus(PERSONAL_WIFI_SSID, "connecting...", WIFI_STATUS_HOLD_MS);
@@ -373,9 +351,6 @@ static void beginWifiConnection() {
 
 static void requestNtpSync() {
   if (WiFi.status() != WL_CONNECTED) return;
-  // NTP always supplies UTC. configTzTime keeps localtime_r() fixed to
-  // China Standard Time instead of replacing TZ with UTC as configTime(0, 0)
-  // would do.
   configTzTime(TIMEZONE, NTP_PRIMARY, NTP_SECONDARY, NTP_TERTIARY);
   ntpConfigured = true;
   ntpSynchronized = false;
@@ -516,10 +491,7 @@ static void loadBigScanCgram(uint8_t scanRow) {
     lcd.createChar(glyph, masked);
   }
   for (uint8_t row = 0; row < 8; ++row) {
-    // ROM 0xFF cannot be changed, so slot 6 temporarily provides a solid
-    // block whose pixels are revealed through the current scan row.
     solid[row] = row <= scanRow ? B11111 : B00000;
-    // Blank target cells display only the travelling line in slot 7.
     line[row] = row == scanRow ? B11111 : B00000;
   }
   lcd.createChar(BIG_SCAN_SOLID_GLYPH, solid);
@@ -552,10 +524,6 @@ static void updateBigScan(const uint8_t actualDigits[4], const uint8_t seconds[2
 
   if (bigScanRow >= 7) {
     bigScanActive = false;
-    // Restore only CGRAM 0..5 here. DDRAM still contains temporary slot 6 in
-    // scanned solid cells and slot 7 in scanned blank cells. Loading seconds
-    // into those slots now would flash their digits across HH:MM. The draw
-    // below first replaces them with ROM 0xFF/spaces, then restores slots 6/7.
     loadNormalBigGlyphs();
     bigScanRestorePending = true;
 #if SHOW_SECONDS
@@ -571,8 +539,6 @@ static void updateBigScan(const uint8_t actualDigits[4], const uint8_t seconds[2
 
 static void writeScanCell(uint8_t code) {
   if (code == BIG_TOKEN_BLANK) lcd.write(BIG_SCAN_LINE_GLYPH);
-  // Seconds are hidden during a big scan, leaving slot 6 available for the
-  // animated replacement of the otherwise immutable ROM 0xFF block.
   else if (code == LCD_SOLID_BLOCK) lcd.write(BIG_SCAN_SOLID_GLYPH);
   else lcd.write(code);
 }
@@ -589,7 +555,6 @@ static void writeBigDigitForScan(uint8_t row, uint8_t digit, bool scanning) {
 
 static void writeCenterColon(bool visible, bool scanning) {
   if (scanning) {
-    // Keep the scan line continuous through the colon cell.
     lcd.write(BIG_SCAN_LINE_GLYPH);
   } else if (!visible) {
     lcd.write(' ');
@@ -616,8 +581,6 @@ static void readDisplayTime(uint32_t nowMs, uint8_t digits[4], uint8_t seconds[2
     minute = static_cast<uint8_t>(local.tm_min);
     second = static_cast<uint8_t>(local.tm_sec);
   } else {
-    // Before the first successful NTP sync, show uptime beginning at 00:00:00.
-    // The internal build/saved epoch remains available for TLS certificate checks.
     const uint32_t elapsedSeconds = nowMs / 1000U;
     hour = static_cast<uint8_t>((elapsedSeconds / 3600U) % 24U);
     minute = static_cast<uint8_t>((elapsedSeconds / 60U) % 60U);
@@ -663,9 +626,6 @@ static void drawBigClockPixelScan(uint32_t nowMs) {
   lcd.write(' ');
   lcd.write(' ');
 
-  // At this point every temporary slot-6/7 reference in the HH:MM area has
-  // been replaced by ROM 0xFF, a normal space, or the colon. It is now safe
-  // to turn slots 6/7 back into seconds glyphs without flashing them in HH:MM.
   if (bigScanRestorePending) {
 #if SHOW_SECONDS
     memcpy(secondsPrevious, actualSeconds, sizeof(secondsPrevious));
@@ -781,10 +741,16 @@ static void drawBigClockDirectOrFlip(uint32_t nowMs) {
   writeCenterColon(lastColonVisible, false);
 
 #if SHOW_SECONDS
-  updateSecondsScan(actualSeconds, nowMs);
-  lcd.setCursor(14, 1);
-  lcd.write(SECOND_GLYPH_TENS);
-  lcd.write(SECOND_GLYPH_ONES);
+  if (WiFi.status() == WL_CONNECTED && ntpSynchronized) {
+    updateSecondsScan(actualSeconds, nowMs);
+    lcd.setCursor(14, 1);
+    lcd.write(SECOND_GLYPH_TENS);
+    lcd.write(SECOND_GLYPH_ONES);
+  } else {
+    lcd.setCursor(14, 1);
+    lcd.write(' ');
+    lcd.write(' ');
+  }
 #else
   lcd.setCursor(14, 1);
   lcd.write(' ');
@@ -802,6 +768,8 @@ static void drawBigClock(uint32_t nowMs) {
 
 // ---------- Network state machine ----------
 static void updateNetworkAndTime() {
+  if (wifiGaveUp) return;
+
   const uint32_t now = millis();
   const wl_status_t wifiStatus = WiFi.status();
 
@@ -822,9 +790,6 @@ static void updateNetworkAndTime() {
     if (ntpConfigured && !ntpSynchronized) {
       bool syncComplete = sntpHasCompleted();
 #if !HAS_SNTP_STATUS_API
-      // Older cores do not expose the SNTP status API. In that case the
-      // fallback is deliberately conservative: only a valid clock after the
-      // request has had time to complete is accepted.
       syncComplete = currentTimeIsValid() && (now - ntpStartedAt > 3000);
 #endif
       if (syncComplete) {
@@ -836,28 +801,41 @@ static void updateNetworkAndTime() {
         showStatus("WiFi + NTP OK", ip.c_str(), WIFI_STATUS_HOLD_MS);
       } else if (!ntpFailureShown && now - ntpStartedAt >= NTP_FIRST_SYNC_TIMEOUT_MS) {
         ntpFailureShown = true;
-        nextNtpAttemptAt = now + NTP_RETRY_DELAY_MS;
-        USB_SERIAL_PORT.println("NTP synchronization timed out; keeping local clock and retrying later");
+        USB_SERIAL_PORT.println("NTP synchronization timed out; will retry next attempt");
       }
     }
 
-    if (ntpFailureShown && now >= nextNtpAttemptAt) requestNtpSync();
+    if (ntpFailureShown) {
+      WiFi.disconnect();
+      networkState = NetworkState::Disconnected;
+      if (wifiAttemptCount >= WIFI_MAX_ATTEMPTS) {
+        wifiGaveUp = true;
+        USB_SERIAL_PORT.println("All WiFi attempts used, giving up");
+        showStatus("WiFi failed", "using internal clock");
+      } else {
+        nextWifiAttemptAt = now + WIFI_RETRY_DELAY_MS;
+      }
+    }
     return;
   }
 
   if (networkState == NetworkState::Connected) {
     networkState = NetworkState::Disconnected;
-    nextWifiAttemptAt = now + WIFI_RETRY_DELAY_MS;
-    USB_SERIAL_PORT.println("WiFi disconnected; clock continues while reconnecting");
-    showStatus("WiFi lost", "reconnecting...", WIFI_STATUS_HOLD_MS);
+    USB_SERIAL_PORT.println("WiFi disconnected");
   }
 
   if (networkState == NetworkState::Connecting && now - connectStartedAt >= WIFI_CONNECT_TIMEOUT_MS) {
-    USB_SERIAL_PORT.println("WiFi connection timed out; will retry");
     WiFi.disconnect();
     networkState = NetworkState::Disconnected;
-    nextWifiAttemptAt = now + WIFI_RETRY_DELAY_MS;
-    showStatus("WiFi timeout", "retrying...", WIFI_STATUS_HOLD_MS);
+    USB_SERIAL_PORT.printf("WiFi attempt %u/%u timed out\n", wifiAttemptCount, WIFI_MAX_ATTEMPTS);
+
+    if (wifiAttemptCount >= WIFI_MAX_ATTEMPTS) {
+      wifiGaveUp = true;
+      USB_SERIAL_PORT.println("All WiFi attempts failed, using internal clock");
+      showStatus("WiFi failed", "using internal clock");
+    } else {
+      nextWifiAttemptAt = now + WIFI_RETRY_DELAY_MS;
+    }
     return;
   }
 
@@ -882,6 +860,12 @@ void setup() {
 
   preferences.begin("pixel-clock", false);
   restoreLastKnownTime();
+  
+  // 👇 开机强制保存一次当前时间到 Flash
+  saveCurrentTime(true);
+  
+  lastTimeSaveAt = millis();
+  displayTimeSynchronized = true;
 
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   Wire.setClock(I2C_CLOCK_HZ);
@@ -893,7 +877,6 @@ void setup() {
   const int lcdStatus = lcd.begin(LCD_COLUMNS, LCD_ROWS);
   if (lcdStatus == 0) {
     lcdReady = true;
-    // A visible blink proves that P3 and the PCF8574T output path respond.
     lcd.noBacklight();
     delay(300);
     lcd.backlight();
@@ -926,8 +909,6 @@ void loop() {
                             || networkState == NetworkState::SecurityError;
   const bool statusHoldFinished = static_cast<int32_t>(now - clockDisplayAfter) >= 0;
 #if SHOW_SECONDS
-  // Seconds need a regular tick even while no animation is active so a
-  // second boundary is detected promptly.
   const uint32_t refreshInterval = SECOND_SCAN_FRAME_MS;
 #else
 #if HHMM_ANIMATION_MODE == HHMM_ANIMATION_PIXEL_SCAN
@@ -943,6 +924,11 @@ void loop() {
     lastClockDrawAt = now;
     lastColonVisible = ((now / 500U) % 2U) == 0U;
     drawBigClock(now);
+  }
+
+  if (now - lastTimeSaveAt >= 60UL * 60UL * 1000UL) {
+    lastTimeSaveAt = now;
+    saveCurrentTime();
   }
 
   delay(20);
